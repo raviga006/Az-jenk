@@ -8,7 +8,7 @@ pipeline {
             steps{
                  ansiColor('xterm') {
                     withCredentials([azureServicePrincipal(
-                    credentialsId:'Az-terrraform-storage',
+                    credentialsId:'e43d2101-4100-4ae5-adf6-254aa5da5839',
                     subscriptionIdVariable: 'ARM_SUBSCRIPTION_ID',
                     clientIdVariable: 'ARM_CLIENT_ID',
                     clientSecretVariable: 'ARM_CLIENT_SECRET',
@@ -23,7 +23,7 @@ pipeline {
             steps{
                 ansiColor('xterm') {
                     withCredentials([azureServicePrincipal(
-                    credentialsId:'Az-terrraform-storage',
+                    credentialsId:'e43d2101-4100-4ae5-adf6-254aa5da5839',
                     subscriptionIdVariable: 'ARM_SUBSCRIPTION_ID',
                     clientIdVariable: 'ARM_CLIENT_ID',
                     clientSecretVariable: 'ARM_CLIENT_SECRET',
@@ -38,7 +38,7 @@ pipeline {
             steps{
                  ansiColor('xterm') {
                     withCredentials([azureServicePrincipal(
-                    credentialsId:'Az-terrraform-storage',
+                    credentialsId:'e43d2101-4100-4ae5-adf6-254aa5da5839',
                     subscriptionIdVariable: 'ARM_SUBSCRIPTION_ID',
                     clientIdVariable: 'ARM_CLIENT_ID',
                     clientSecretVariable: 'ARM_CLIENT_SECRET',
