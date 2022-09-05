@@ -3,7 +3,7 @@ pipeline {
     tools {
        terraform 'terraform'
     }
-        }
+    stages {
         stage('terraform format check') {
             steps{
                  ansiColor('xterm') {
@@ -46,7 +46,7 @@ pipeline {
             }
             }
         }
-    
+    }
 
     
 }
