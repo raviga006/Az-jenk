@@ -13,6 +13,6 @@ terraform{
 }
 
 resource "azurerm_resource_group" "polo"{
-    name = "polo-1"
+    name = "polo-12"
     location = "South India"
 }
