@@ -10,7 +10,7 @@ pipeline{
     }
     stages {
     
-        stage('Terraform Init'){
+        stage('Terraform init'){
             
             steps {
                     ansiColor('xterm') {
