@@ -3,11 +3,6 @@ pipeline {
     tools {
        terraform 'terraform'
     }
-    stages {
-        stage('Git checkout') {
-           steps{
-                git branch: 'main', credentialsId: 'jking-pkey', url: 'https://github.com/raviga006/Az-jenk.git'
-            }
         }
         stage('terraform format check') {
             steps{
@@ -51,7 +46,6 @@ pipeline {
             }
             }
         }
-    }
-
+    
     
 }
