@@ -16,7 +16,7 @@ pipeline {
                 ), string(credentialsId: 'access_key', variable: 'ARM_ACCESS_KEY')]
                     sh """
                         echo "Format Terraform"
-                        terraform fmt --auto-approve -backend-config="access_key=$ARM_ACCESS_KEY"' 
+                        'terraform fmt --auto-approve -backend-config="access_key=$ARM_ACCESS_KEY"' 
                         """
                 }
             }
