@@ -14,10 +14,7 @@ pipeline {
                     clientSecretVariable: 'ARM_CLIENT_SECRET',
                     tenantIdVariable: 'ARM_TENANT_ID'
                 ), string(credentialsId: 'access_key', variable: 'ARM_ACCESS_KEY')]
-                    sh """
-                        echo "Format Terraform"
-                        'terraform fmt --auto-approve -backend-config="access_key=$ARM_ACCESS_KEY"' 
-                        """
+                  sh 'terraform fmt -backend-config="access_key=$ARM_ACCESS_KEY"'
                 }
             }
             }
@@ -32,10 +29,7 @@ pipeline {
                     clientSecretVariable: 'ARM_CLIENT_SECRET',
                     tenantIdVariable: 'ARM_TENANT_ID'
                 ), string(credentialsId: 'access_key', variable: 'ARM_ACCESS_KEY')]){
-                     sh """
-                        echo "Initialising Terraform"
-                        terraform init --auto-approve -backend-config="access_key=$ARM_ACCESS_KEY"' 
-                        """
+                     sh 'terraform init --auto-approve  -backend-config="access_key=$ARM_ACCESS_KEY"'
                     }
                 }
             }
