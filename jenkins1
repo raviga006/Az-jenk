@@ -1,0 +1,558 @@
+#!/usr/bin/env groovy # to get syntax highlights
+@Library(['pipeline-toolbox', 'iac-pipeline-shared-lib']) _
+
+/* ****************************** *
+ *                                *
+ *          JOB PARAMETERS        *
+ *                                *
+ * ****************************** */
+
+/* Only branches matching those pattern will be processed
+ * Others may start a build (depends on you multibranch config)
+ * but the job will just start, say 'I won't do anything', then stop.
+ * Those are regex values and the whole branch must match (i.e. we check for ^allowed_branch$)
+ */
+ALLOWED_BRANCHES = [
+  'master', // First allowed branch is the `main` one, which triggers an actual deployment
+  'PR-.+',
+  'feature/.+',
+  'hotfix/.+',
+]
+
+/* Other credentials - quick & dirty ad-hoc list
+  * - https://www.jenkins.io/doc/pipeline/steps/credentials-binding/
+  * - https://javadoc.jenkins.io/plugin/credentials-binding/index.html?org/jenkinsci/plugins/credentialsbinding/class-use/MultiBinding.html
+ */
+CREDENTIALS = [
+  // sca access to Artifactory -- General artifacts
+  [$class: 'UsernamePasswordMultiBinding',  credentialsId: "DML_CREDENTIALS",   usernameVariable: 'DML_LOGIN', passwordVariable: 'DML_PASSWORD'],
+  // sca access to Artifactory -- Docker images
+  [$class: 'StringBinding',                 credentialsId: "OCP_PULL_SECRETS",  variable: 'OCP_PULL_SECRETS'],
+  // sca Calico license -- YAML file
+  [$class: 'FileBinding',                   credentialsId: "CALICO_SECRETS",    variable: 'CALICO_SECRETS'],
+  // sca Installer access -- FIXME: use sca_SSH_KEY instead
+  [$class: 'StringBinding',                 credentialsId: "TST_SSH_PUBLIC_KEY",  variable: 'TST_SSH_PUBLIC_KEY'],
+  [$class: 'FileBinding',                   credentialsId: "TST_SSH_PRIVATE_KEY", variable: 'TST_SSH_PRIVATE_KEY'],
+  // sca SSH installer private key
+  [$class: 'SSHUserPrivateKeyBinding',      credentialsId: "sca_SSH_KEY",         usernameVariable: 'sca_SSH_USERNAME', keyFileVariable: 'sca_SSH_PRIVATE_KEY', passphraseVariable: 'sca_SSH_PASSPHRASE'],
+
+  // project in the GOB uses Keycloak, not Azure Active Directory
+  [$class: 'UsernamePasswordMultiBinding',  credentialsId: "KEYCLOAK_CREDENTIALS",   usernameVariable: 'KEYCLOAK_CLIENT_ID', passwordVariable: 'KEYCLOAK_CLIENT_SECRET'],
+  [$class: 'UsernamePasswordMultiBinding',  credentialsId: "VENAFI_SECRET",   usernameVariable: 'VENAFI_LOGIN', passwordVariable: 'VENAFI_PASSWORD'],
+  
+  // CyberArk safe password
+  [$class: 'StringBinding',  credentialsId: "CYBERARK_SA_PASS_SVC_TF_SYNC",  variable: 'CYBERARK_SA_PASS_SVC_TF_SYNC'],
+  [$class: 'UsernamePasswordMultiBinding',  credentialsId: "IZ_USER",   usernameVariable: 'BIND_USER', passwordVariable: 'BIND_PASSWORD'],
+]
+
+/* The Docker image to use to run Terragrunt, Terraform & underneath tools. It should be a
+ * released version from: https://jenkins-pipeline-tpecdx.cicd.rnd.company.net/job/IAC/job/Automation%20Image/job/terraform-automation-base-azr/
+ */
+AUTOMATION_IMAGE = "repository.adp.company.net/docker-production/iac/terraform-automation"
+
+/* At first run on a branch or for a PR, values will be not set and the job will fail if we do not handle this use case.
+ * For this, we use a default value map + a final value map.
+ * For each expected param, the final map will be filled with either the param value (when set) or the default one.
+ */
+DEFAULT_VALUES = [
+  TERRAFORM_COMMAND   : 'apply',
+  COMMAND_PREFIX      : '',
+  SUBSCRIPTION_FILTER : '',
+  COMPONENT_FILTER    : '',
+  PARALLEL_AMOUNT     : '10',
+]
+
+FINAL_VALUES = [:]
+
+JOB_PARAMETERS = [
+  string(name: 'TERRAFORM_COMMAND', defaultValue: DEFAULT_VALUES.TERRAFORM_COMMAND, description: "Terraform command to run on every module (default is ${DEFAULT_VALUES.TERRAFORM_COMMAND})."),
+  string(name: 'COMMAND_PREFIX', defaultValue: DEFAULT_VALUES.COMMAND_PREFIX, description: "Terragrunt command prefix (default is ${DEFAULT_VALUES.COMMAND_PREFIX})."),
+  string(name: 'SUBSCRIPTION_FILTER', defaultValue: DEFAULT_VALUES.SUBSCRIPTION_FILTER, description: '''Specific full path of subscription(s) to redeploy.<br/>
+    Use <em>comma</em> to provide several subscriptions, use <em>*</em> for all subscriptions.<br/>
+    Default is <em>diff from previous commit</em>. No subscription change in last commit will select them all.'''),
+  string(name: 'COMPONENT_FILTER', defaultValue: DEFAULT_VALUES.COMPONENT_FILTER, description: '''Specific component(s) to redeploy.<br/>
+    Naming convention: use the folder name under the subscription folder like <em>subscription-management</em> or <em>net-01/nsg</em>.<br/>
+    Use <em>,</em> to provide several components ex: <em>subscription-management,net-01/nsg</em>.<br/>
+    Default is <em>diff from previous commit</em>. No component change in last commit will select them all.'''),
+  string(name: 'PARALLEL_AMOUNT', defaultValue: DEFAULT_VALUES.PARALLEL_AMOUNT, description: 'Amount of parallelisation while processing the subscriptions.'),
+]
+
+/* ****************************** *
+ *                                *
+ *            CONST               *
+ *                                *
+ * ****************************** */
+SUBSCRIPTION_SOURCE_FOLDER = 'src'
+SUBSCRIPTION_FILENAME = 'subscription.yml'
+
+/* ****************************** *
+ *                                *
+ *        Git Diff Helpers        *
+ *                                *
+ * ****************************** */
+def getChangedFilesFromPR(path=''){
+	return getDiffFilesFromPR(path, 'd')
+}
+def getDeletedFilesFromPR(path=''){
+	return getDiffFilesFromPR(path, 'D')
+}
+def getDiffFilesFromPR(path='', diffFilterOption=null){
+  return getDiffFiles(path, diffFilterOption, "${env.COMMIT_TARGET}..${env.COMMIT_SOURCE}")
+}
+def getChangedFilesFromPrevious(path=''){
+  return getDiffFiles(path, 'd')
+}
+def getDeletedFilesFromPrevious(path=''){
+  return getDiffFiles(path, 'D')
+}
+/**
+ *  Return the path of all changed files matching the given options
+ *
+ *  @param path             Root path to perform the git diff, only files under this path will be returned.
+ *                          Default is the root of git repository
+ *  @param diffFilterOption Option to add to git diff --diff-filter. Default is no specific option
+ *  @param diffSource       Target/source to compare. Default is current commit vs previous commit (HEAD^)
+ *  @return String[]        Path list of the files that changed - empty list if no change
+ */
+def getDiffFiles(path='', diffFilterOption=null, diffSource='HEAD^'){
+  List list = sh (returnStdout: true, script: "git diff ${diffFilterOption ? '--diff-filter='+diffFilterOption : ''} --name-only ${diffSource} ${path}").split('\n')
+  // Because of how behaves split, the list may contain 1 empty string instead of being an empty list
+  return list.minus('')
+}
+
+/**
+ * @return true if the build is triggered by a PR, false otherwise (standard branch or not multibranch)
+ */
+def isPR(){
+  return env.BRANCH_NAME && env.BRANCH_NAME.startsWith('PR-')
+}
+
+/**
+ * @return true if the build is triggered by the main branch (first allowed one), false otherwise (standard branch or not multibranch)
+ */
+def isMain(){
+  return env.BRANCH_NAME && env.BRANCH_NAME.equals(ALLOWED_BRANCHES[0])
+}
+
+
+/* ****************************** *
+ *                                *
+ *      Starting the process      *
+ *                                *
+ * ****************************** */
+timestamps {
+
+  stage('Preprocessing'){
+    if (!env.BRANCH_NAME) {
+      error "Only multibranch pipelines are supported."
+    }
+    // If the branch is not allowed we just skip the whole process
+    // We also ensure a 'strict' match (from start to end of the branch name)
+    if (!ALLOWED_BRANCHES.any { env.BRANCH_NAME =~ "^${it}\$" }) {
+      echo """
+      Only branches strictly matching these patterns are built:
+      ${ALLOWED_BRANCHES}
+      Branch ${env.BRANCH_NAME} will be ignored.
+      """
+      return
+    } else {
+      echo "Branch ${env.BRANCH_NAME} is part of the accepted branches and will be processed."
+    }
+
+    //PRs do not need parameters, they rely on default values for dry-run
+    if (!isPR()){
+      properties([
+        parameters(JOB_PARAMETERS)
+      ])
+    } else {
+      echo "Pull request identified: it always relies on git differences and default parallelisation amount."
+    }
+
+    DEFAULT_VALUES.each { paramName, defaultValue ->
+      // If param value is not null, we use the value, otherwise we use the default
+      // Note: we let empty value override the default one
+      FINAL_VALUES[paramName] = params[paramName]!=null ? params[paramName] : defaultValue;
+    }
+  }
+
+  // Before requesting for a node, we check the params are valid
+  int parallelisation
+  List subscriptionFilterList
+  List componentFilterList
+
+  stage('Check Final Parameters') {
+    try {
+      parallelisation = FINAL_VALUES.PARALLEL_AMOUNT as int
+      if( parallelisation <= 0){
+        error 'PARALLEL_AMOUNT must be greater than 0'
+      } else {
+        echo "Subscriptions will be processed by batches of ${parallelisation}."
+      }
+    } catch (e) {
+      error "PARALLEL_AMOUNT '${FINAL_VALUES.PARALLEL_AMOUNT}' is not a number."
+    }
+    // Get the filter lists (each filter value is trimmed)
+    subscriptionFilterList = filterStringtoList(FINAL_VALUES.SUBSCRIPTION_FILTER)
+    componentFilterList = filterStringtoList(FINAL_VALUES.COMPONENT_FILTER)
+    echoFilter('subscription', subscriptionFilterList)
+    echoFilter('component', componentFilterList)
+  }
+
+  timeout(time: 120, unit: 'MINUTES') {
+    podTemplate(yaml: """
+    apiVersion: v1
+    kind: Pod
+    spec:
+      securityContext:
+        runAsUser: 1000
+      containers:
+      - name: terragrunt
+        image: ${AUTOMATION_IMAGE}
+        resources:
+          requests:
+            cpu: "2"
+            memory: "2Gi"
+          limits:
+            memory: "5Gi"
+        command:
+        - cat
+        tty: true
+    """) {
+      node(POD_LABEL) {
+        try {
+          stage('Fetch source') {
+            checkout scm
+          }
+          def subscriptionInfoList = []
+          stage('Retrieve Subscriptions') {
+
+            if(!subscriptionFilterList){
+              echo 'Computing changes to apply only what changed'
+              subscriptionFilterList = getChangedSubscriptionList()
+            }
+
+            subscriptionInfoList = getSubscriptionInfoList(subscriptionFilterList)
+            echo "Subscriptions to process: ${subscriptionInfoList}"
+          }
+
+          def environmentsList = subscriptionInfoList.groupBy{
+            it.environment
+          }.keySet()
+          echo "Environments to create remote_state.hcl for: ${environmentsList}"
+          environmentsList.each{ environment ->
+            generateRemoteStateDescriptor(environment)
+          }
+
+          /*
+          *            Parallel process
+          *
+          * First, we split the subscription list into several smaller ones
+          * Then, each element of the same sublist is processed in parallel
+          */
+          def echoCount = 0   // only for echo - no role inside the loop
+          subscriptionInfoList.collate(parallelisation).each{ parallelList ->
+            echo "Starting batch #${++echoCount}"
+            def parallelTerragruntProcess = [:]
+            parallelList.each{ subscriptionInfo ->
+              parallelTerragruntProcess[subscriptionInfo.key] = {
+                def componentFolders = findComponentFolders(subscriptionInfo,componentFilterList)
+                terragruntApplyToSubscriptionWithLock(subscriptionInfo,componentFolders)
+              }
+            }
+            parallel parallelTerragruntProcess
+          }
+          echo "Parallel process was done in ${echoCount} batch(es)"
+        } // try
+        finally {
+          echo 'Uploading non-sensitive terraform output as output.json and terraform.log as pipeline artifacts'
+          // https://www.jenkins.io/doc/pipeline/tour/tests-and-artifacts/
+          archiveArtifacts artifacts: '**/output.json', fingerprint: true, allowEmptyArchive: true
+
+          echo 'Uploading terraform-*.log as pipeline artifacts'
+          // https://www.jenkins.io/doc/pipeline/tour/tests-and-artifacts/
+          archiveArtifacts artifacts: '**/terraform-*.log', fingerprint: true, allowEmptyArchive: true
+        }
+      } // node()
+    } // podTemplate()
+  } // timeout()
+} // timestamps
+
+/**
+ *  Perform a git diff and return the name of all subscriptions that changed
+ *  In case a file at location or environment level was changed, then it returns the location or environment directly.
+ *  e.g. if location.yml in rnd/westeurope changed, then the string will be rnd/westeurope
+ *
+ *  @return String[] containing the subscriptions that changed compared to the previous commit. [] if none
+ */
+def getChangedSubscriptionList(){
+  def changedSubscriptionList = []
+  def changes = isPR() ? getDiffFilesFromPR(SUBSCRIPTION_SOURCE_FOLDER) : getDiffFiles(SUBSCRIPTION_SOURCE_FOLDER, "ACM")
+
+  // For each changed file, we return only the subscription folder it was in
+  changes.each{ f ->
+    def pathFromSourceFolder = f.substring(SUBSCRIPTION_SOURCE_FOLDER.length()+1) // remove source folder (note: list.drop is blacklisted)
+    def path = pathFromSourceFolder.split('/').dropRight(1)    // remove filename
+    // We keep max 3 levels of folder (<environment>/<location>/<subscription>)
+    echo "Adding subscription '${path}' for changed file '${f}'"
+    changedSubscriptionList.add( path.take(3).join('/') )
+  }
+
+  return changedSubscriptionList.toUnique()   // Do not forget to remove duplicates
+}
+
+/**
+ *  Get all matching subscriptions inside the SUBSCRIPTION_SOURCE_FOLDER folder according to the provided filters.
+ *  The subscription filters can also contain envs or locations instead of subscriptions.
+ *  In that case, all the subscriptions inside the environment or location will be returned.
+ *
+ *  @prereq There is 3 levels of folder inside SUBSCRIPTION_SOURCE_FOLDER: <environment>/<location>/<subscription>
+ *  @prereq Each subscription folder contains a file named: SUBSCRIPTION_FILENAME
+ *
+ *  @param subscriptionFilterList   filtered subscriptions. If empty, all subscriptions will be returned
+ *  @return                         Object[] containing the {environment, location, name} of the subscriptions. [] if none
+ */
+def getSubscriptionInfoList(subscriptionFilterList){
+  def subscriptionInfoList = []
+  dir(SUBSCRIPTION_SOURCE_FOLDER){
+    def subscriptionFiles = findSubscriptionFiles(subscriptionFilterList)
+
+    subscriptionFiles.each{ f ->
+      def dir = sh ( script: "path=${f.path}; echo \${path%/*}", returnStdout: true )
+      subscription  = readYaml file: f.path
+      location      = readYaml file: "${dir}/../location.yml"
+      environment   = readYaml file: "${dir}/../../env.yml"
+
+      subscriptionInfoList.add([
+        'environment'   : "${environment.environment_name}",
+        'location'      : "${location.location}",
+        'name'          : "${subscription.subscription_name}",
+        'key'           : "${environment.environment_dns_label}_${location.location_label}_${subscription.subscription_dns_label}".toUpperCase(),
+      ])
+    }
+  }
+
+  return subscriptionInfoList;
+}
+
+/**
+ *  From the current dir, return all subscriptions matching the current filter
+ *  The subscription filters can also contain envs or locations instead of subscriptions.
+ *  In that case, all the subscriptions inside the environment or location will be returned.
+ *
+ *  @prereq There is 3 levels of folder: <environment>/<location>/<subscription>
+ *  @prereq Each subscription folder contains a file named: SUBSCRIPTION_FILENAME
+ *
+ *  @param subscriptionFilterList   paths of filtered subscriptions. If empty, all subscriptions will be returned
+ *  @return                         String[] with the following format: <environment>/<location>/<name> of the subscription
+ */
+def findSubscriptionFiles(subscriptionFilterList){
+  def subscriptionFiles = []
+  // In case filters are provided, we get only subscriptions matching the filters
+  if(subscriptionFilterList){
+    subscriptionFilterList.each { filter ->
+      def glob = "**/${filter}/${SUBSCRIPTION_FILENAME}"
+      echo " Subscription glob for '${filter}' is '${glob}'"
+      subscriptionFiles.addAll(findFiles(glob: glob))
+    }
+    // If no filter provided, all subscriptions are retrieved
+  } else {
+    echo " Subscription filter '*': picking all of them."
+    subscriptionFiles = findFiles(glob: "**/${SUBSCRIPTION_FILENAME}")
+  }
+  echo "Found: ${subscriptionFiles}"
+  return subscriptionFiles
+}
+
+/**
+ *  From the subscription dir, return all terraform modules(components) matching the current filter and build the terragrunt command to apply only on these terraform modules.
+ *  If no componentFilterList filter exist than use standard run-all terragrunt command.
+ *
+ *  @prereq There is 3 levels of folder: <environment>/<location>/<subscription>
+ *
+ *  @param componentFilterList      list of component(s) to be filtered. If empty will use all terraform module by default
+ *  @param subscriptionFilterList   paths of filtered subscriptions. If empty, all subscriptions will be returned
+ *  @return                         String with the following format: "--terragrunt-strict-include --terragrunt-include-dir ./net-01/nsg/ --terragrunt-include-dir ./subscription-management/" or empty
+ */
+def findComponentFolders(subscriptionInfo,componentFilterList){
+  def componentFolders = ''
+  // In case filters are provided, we get only components matching the filters
+  if(componentFilterList){
+    def environment = subscriptionInfo.environment
+    def location = subscriptionInfo.location
+    def subscription = subscriptionInfo.name
+
+    dir("${SUBSCRIPTION_SOURCE_FOLDER}/${environment}/${location}/${subscription}") {
+        // --terragrunt-strict-include force terragrunt to no apply on dependencies, ex destroy will run only on COMPONENT_FILTER terraform modules and not on its dependencies
+        componentFolders='--terragrunt-strict-include'
+        def componentFilterStrings = FINAL_VALUES.COMPONENT_FILTER.split(',')
+        echo "componentFilterStrings = ${componentFilterStrings}"
+        for (componentFilter in componentFilterStrings) {
+          def i='notpresent'
+          // We must ensure each entry in FINAL_VALUES.COMPONENT_FILTER are valid, as without proper filter, by default all components will be selected.
+          def files = findFiles(glob: '**/terragrunt.hcl')
+          files.each{ f ->
+              def folder = f.path - "/terragrunt.hcl"
+              if ( folder == componentFilter ) {
+                 componentFolders=componentFolders.replaceAll("[\n\r]", "") + ' --terragrunt-include-dir' + ' ' + folder
+                 echo "${componentFolders}"
+                 i='present'
+              }
+          }
+          if ( i == 'notpresent' ){
+              // exit Jenkins pipeline in case COMPONENT_FILTER is invalid
+              error ("Filter ${componentFilter} is not a valid COMPONENT_FILTER")
+          }
+        }
+    }
+    echo "Component to be added to terragrunt execution: ${componentFolders}"
+  } else {
+     echo "No component filter, using all components"
+  }
+  return componentFolders
+}
+
+/**
+ * Transform the filter String to a list of filters.
+ * The separator is ',' and all values are trimmed
+ * If the filter is empty (included whitespace only), then an empty list is returned
+ *
+ * @return  String[] of filters. [] if no filter provided
+ */
+def filterStringtoList(filter){
+  // In case the filter is an empty string or starts with an empty string, split returns a list with 1 empty string
+  //    instead of returning an empty list / list without empty string. Hence the minus...
+  return filter.trim().split('\\s*,\\s*').toUnique().minus('')
+}
+
+/**
+ * Echo if the filter is specified and with what value
+ *
+ * @param name  name of the filter to echo
+ * @param list  values of the filter to echo (as String[])
+ */
+def echoFilter(name, list){
+  if(list){
+    echo "${name.capitalize()} provided. Only the following will be processed.\n${list.join('\n')}"
+  } else {
+    echo "No ${name} provided. ${name.capitalize()}s will be processed from git diff."
+  }
+}
+
+/**
+ * For the given subscription, generate its state file
+ *
+ * @param   String the environment name
+ */
+def generateRemoteStateDescriptor(environment) {
+
+  stage("Generate terraform remote_state.tf for ${environment}") {
+    withCredentials([
+      string(credentialsId: "AZURE_STORAGE_ACCOUNT",    variable: 'AZURE_STORAGE_ACCOUNT'),
+      string(credentialsId: "AZURE_STORAGE_CONTAINER",  variable: 'AZURE_STORAGE_CONTAINER'),
+      string(credentialsId: "ARM_ACCESS_KEY",           variable: 'ARM_ACCESS_KEY'),
+    ]) {
+      def remoteState = [
+        'storage_account_name': env.AZURE_STORAGE_ACCOUNT,
+        'container_name'      : env.AZURE_STORAGE_CONTAINER,
+        'access_key'          : env.ARM_ACCESS_KEY,
+      ]
+      writeYaml file: "${SUBSCRIPTION_SOURCE_FOLDER}/${environment}/remote_state.yml", data: remoteState, overwrite: true
+      
+      sh """
+        for i in {1..5}
+        do
+          timeout 2 bash -c "</dev/tcp/${env.AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/443" && echo "Storage account test success" && break || sleep 15 && echo "Storage account test failed retrying"
+        done
+      """
+    }
+  }
+}
+
+/**
+  * For the given subscription, execute terragrunt commands
+ * A lock will be applied based on the subscription key,
+ * so parallel job execution on the same subscription will not conflict
+ * 
+ * @param   Object containing {environment, location, name} of the subscription
+ */
+def terragruntApplyToSubscriptionWithLock(subscriptionInfo, componentFolders){
+  if (!isMain()){
+      terragruntApplyToSubscription(subscriptionInfo, componentFolders) // Not locking for terragrunt validate
+    } else {
+      lock("tg-sub-key-${subscriptionInfo.key}"){
+        terragruntApplyToSubscription(subscriptionInfo, componentFolders) // Locking for terragrunt apply
+      }
+    }
+}
+
+/**
+ * For the given subscription, execute terragrunt commands
+ * No automatic lock is done - please handle any required lock before calling this function 
+ *
+ * @param   Object containing {environment, location, name} of the subscription
+ */
+def terragruntApplyToSubscription(subscriptionInfo, componentFolders){
+  def environment = subscriptionInfo.environment
+  def location = subscriptionInfo.location
+  def subscription = subscriptionInfo.name
+
+  stage("Run terragrunt on ${environment}/${location}/${subscription}") {
+    withCredentials([
+      string(credentialsId: "${subscriptionInfo.key}_CLIENT_ID", variable: 'ARM_CLIENT_ID'),
+      string(credentialsId: "${subscriptionInfo.key}_CLIENT_SECRET", variable: 'ARM_CLIENT_SECRET'),
+      string(credentialsId: "${subscriptionInfo.key}_OBJECT_ID", variable: 'ARM_OBJECT_ID'),
+      string(credentialsId: "ARM_TENANT_ID", variable: 'ARM_TENANT_ID'),
+      string(credentialsId: 'AAD_CLIENT_ID', variable: 'AAD_CLIENT_ID'),
+      string(credentialsId: 'AAD_CLIENT_SECRET', variable: 'AAD_CLIENT_SECRET'),
+    ] + CREDENTIALS) {
+      container('terragrunt') {
+        dir("${SUBSCRIPTION_SOURCE_FOLDER}/${environment}/${location}/${subscription}") {
+          // Moving HELM_* is necessary to `tf-auto-azr-workload`
+          sh """
+            export HELM_CACHE_HOME=\$PWD/.helm/cache
+            export HELM_CONFIG_HOME=\$PWD/.helm/config
+            export HELM_DATA_HOME=\$PWD/.helm/data
+            mkdir -p \$HELM_CACHE_HOME
+            mkdir -p \$HELM_CONFIG_HOME
+            mkdir -p \$HELM_DATA_HOME
+
+            # https://www.terraform.io/docs/internals/debugging.html
+            # export TF_LOG=error
+            # export TF_LOG=warn
+            # export TF_LOG=info
+            # export TF_LOG=debug
+            # export TF_LOG=trace
+
+            # https://terragrunt.gruntwork.io/docs/reference/cli-options/#terragrunt-debug
+            # export TERRAGRUNT_LOG_LEVEL=error
+            # export TERRAGRUNT_LOG_LEVEL=debug
+
+            # Avoid accessing Internet
+            # - https://www.terraform.io/docs/cli/config/config-file.html#disable_checkpoint
+            export CHECKPOINT_DISABLE=1
+
+            # Back-track permissions to GitOps repo in Azure -- Jenkins does (finally not define these by default)
+            export GIT_URL=\$(git config --get remote.origin.url)
+            export GIT_COMMIT=\$(git rev-parse HEAD)
+
+            # Until we have ANSI color support in GOB Jenkins
+            export TF_CLI_ARGS=-no-color
+
+            ${ !isMain() ? "${FINAL_VALUES.COMMAND_PREFIX} \
+                            terragrunt run-all validate \
+                              --terragrunt-tfpath ${WORKSPACE}/src/terraform.sh \
+                              --terragrunt-non-interactive \
+                              --terragrunt-debug \
+                              ${componentFolders}" :
+                            "${FINAL_VALUES.COMMAND_PREFIX} \
+                            terragrunt run-all ${FINAL_VALUES.TERRAFORM_COMMAND} \
+                              --terragrunt-tfpath ${WORKSPACE}/src/terraform.sh \
+                              --terragrunt-non-interactive \
+                              --terragrunt-debug \
+                              ${componentFolders}" }
+            """
+        }
+      }
+    }
+  }
+}
