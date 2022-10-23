@@ -1,0 +1,457 @@
+@Library(['pipeline-toolbox', 'ia-pipeline-shared-lib']) _
+
+import groovy.json.*
+
+forkPrefix = "subnet-";
+DUAKey = "DUA";
+DUAVersion = "";
+CAIKey = "CAI";
+clzKey = "CLZ"
+infobloxOutput = {};
+vnetNotSupported = [subscription]
+
+class Subnet {
+    String comment;
+    String zonename;
+    String zonetype;
+    String cidr;
+    String provider_specific;
+}
+
+class Vnet {
+    String comment;
+    String cidr;
+    String scope;
+}
+
+def checkBuildSuccess(gitUsername, gitPassword,prId,repoName,slugKey){
+    //every 2 min and max 16 min wait time
+    def count = 8;
+    while(count != 0){
+        count-=1;
+        
+    def returnVal = checkDUABuildIsSuccess(gitUsername, gitPassword,prId,repoName,slugKey);
+    if(returnVal){
+        mergePrDUA(gitUsername, gitPassword,prId,repoName,slugKey);
+        return true;
+    }
+    }
+    return false;
+    
+}
+
+def checkDUABuildIsSuccess(gitUsername, gitPassword,prId,repoName,slugKey){
+
+    //2 min
+    sleep(time: 120, unit: "SECONDS")
+    def res=sh(script: """
+                    curl -X GET -H "Content-Type: application/json" -u '${gitUsername}:${gitPassword}' 'https://bitbucket.pob.company.net/rest/ui/latest/projects/${slugKey}/repos/${repoName}/pull-requests/${prId}/build-summaries'
+                """, returnStdout: true)
+
+    def json =  res;
+    def jsonParse = new JsonSlurperClassic().parseText(json)
+    def jsonData = jsonParse[jsonParse.keySet().collect()[0]]
+    if(jsonData.failed == 0 && jsonData.successful > 0 && jsonData.inProgress == 0){
+        return true;
+    }else{
+        return false;
+    }
+}
+
+def mergePrDUA(gitUsername, gitPassword,prId,repoName,slugKey){
+def res=sh(script: """
+                curl -X POST -H "Content-Type: application/json" -H "Accept: application/json" -H "X-Atlassian-Token: no-check"  -u '${gitUsername}:${gitPassword}' 'https://bitbucket.pob.company.net/rest/api/1.0/projects/${slugKey}/repos/${repoName}/pull-requests/${prId}/merge?version=0'\
+                --data '{ \
+                }' \
+            """, returnStdout: true)
+  println(res)
+  sleep(time: 180, unit: "SECONDS")
+}
+
+def createFork(gitUsername, gitPassword,repoName,slugKey,repoKey) {
+    forkName = forkPrefix+repoName;
+    def output=sh(script: """
+                curl --location --request POST -u '${gitUsername}:${gitPassword}' 'https://bitbucket.pob.company.net/rest/api/1.0/projects/${repoKey}/repos/${repoName}' \
+                --header 'Content-Type: application/json' \
+                --data '{ \
+                "name": "${forkName}", \
+                "project": {"key": "${slugKey}"} \
+                }' \
+            """, returnStdout: true)
+
+    sleep(time: 5, unit: "SECONDS")
+    output =  new JsonSlurperClassic().parseText(output)
+    if(output.errors == null){
+        println("fork created with name "+forkName);
+     return forkName;
+    }else{
+        println("fork did not create please check the error below:");
+        println(output)
+        return null;
+    }
+}
+
+def deleteFork(gitUsername, gitPassword,repoName,slugKey){
+ sh(script: """
+                curl --location --request DELETE -u '${gitUsername}:${gitPassword}' 'https://bitbucket.pob.company.net/rest/api/1.0/projects/${slugKey}/repos/${repoName}' \
+                --header 'Content-Type: application/json'
+            """, returnStdout: true);
+    println("fork deleted "+repoName);
+}
+
+def getDUARepoName(vnet){
+vnet = vnet.split("-net-01")[0];
+splitChar = "-"
+def reponame = "DUAs-Infra_";
+    def outputTwo = reponame;
+   
+    def envArray = ["tst","dev","prd","rnd"];
+    def regionArray = ["eus2","wus2","we","ne","gwc"];
+    
+    for(def i = 0;i<envArray.size();i++) { 
+        if(vnet.contains(envArray[i])){
+            //reponame +=
+            if(envArray[i].equals("dev") || envArray[i].equals("rnd") ){
+                outputTwo += "DEV_" 
+            }else{
+                outputTwo += envArray[i].toUpperCase()+"_";
+            }
+            
+        }
+        
+    }
+    //DUAs-Infra_TST_WE_INT
+      for(def i = 0;i<regionArray.size();i++) { 
+        if(vnet.contains(regionArray[i])){
+            outputTwo += regionArray[i].toUpperCase()+"_"
+            def splitWithRegion = vnet.split( regionArray[i]+splitChar)[1].split(splitChar)
+            for(def j = 0;j<splitWithRegion.size();j++) { 
+             outputTwo += splitWithRegion[j].toUpperCase()
+                
+            }
+
+            break;
+        }
+        
+    }
+    return outputTwo;
+}
+
+def getDUADetails(landingZoneName) {
+        def details = [:]
+        def output=sh(script: """
+                        curl -X GET https://DUA-api-prd.pob.company.net/obj/landingzone?name=${landingZoneName}
+                    """, returnStdout: true)
+        output_json=new groovy.json.JsonSlurperClassic().parseText(output)
+        def cidr = output_json.landingzone.cidrs
+        def scope = output_json.landingzone.scope
+        String[] array = cidr.split('/')
+        details.cidr = cidr
+        details.baseAddress = array[0]
+        details.scope = scope
+        println "vnet details ${details}"
+        return details;
+}
+
+
+def buildYAMLgenerationInput(landingZoneName, DUADetails, subnets) {
+    def output = ''
+
+    def subnetDetails = new groovy.json.JsonSlurperClassic().parseText(subnets)
+
+    def list = []
+    def count = 0;
+    def providerSpecificArray = [];
+    subnetDetails.each { 
+        def subnet = new Subnet(comment : it.comment, provider_specific : it.provider_specific, zonename : it.zonename, zonetype : it.zonetype, cidr:infobloxOutput.subnets[count].cidr)
+        count+=1;
+        providerSpecificArray.add(it.provider_specific);
+        list.add(subnet)
+        }
+    def scope = DUADetails.scope;
+    def vnet = new Vnet(comment : landingZoneName, cidr : DUADetails.cidr,scope: scope)
+    output = new JsonBuilder([vnet: vnet, subnets: list, providerSpecific:providerSpecificArray]).toString()
+
+    output = output.replace ("zonename","zone_name")
+    output = output.replace ("zonetype","zone_type") 
+    return output
+}
+
+def buildInfobloxInput(landingZoneName, DUADetails, subnets) {
+
+    println "building infoblox input"
+
+    def list = buildSubnetsList(subnets) 
+    def vnet = new Vnet(comment : landingZoneName ,scope: DUADetails.scope, cidr : DUADetails.cidr)
+    def builder = new JsonBuilder([vnet: vnet, slash_val: list]).toString()
+    
+    println builder
+
+    return builder
+}
+
+def buildSubnetsList(subnets) {
+    def subnetDetails = new groovy.json.JsonSlurperClassic().parseText(subnets);
+    def list = []
+    subnetDetails.each { 
+        def subnet = new Subnet(comment : it.comment, cidr : it.mask, zonename : it.zonename, zonetype: it.zonetype,
+        provider_specific:it.provider_specific);
+        list.add(subnet)
+    }
+    return list
+}
+
+def checkApiIfUpdated(vnet,subnet){
+    //every 10 min and max 80 min wait time
+    //def count = 8;
+    while(true){
+        //count-=1;
+        //10 min
+         sleep(time: 600, unit: "SECONDS")
+        def res=sh(script: """
+                curl -X GET -H "Content-Type: application/json"  -H "Accept: application/json" 'https://DUA-api-prd.tnz.company.net/landingzone/${vnet}/network-security'
+            """, returnStdout: true)
+        res = new JsonSlurperClassic().parseText(res)
+        if(res.subnets != null && res.subnets[subnet]){
+            DUAVersion = res.version;
+            break;
+        }
+       
+    }
+}
+
+def updateInfoblox(data, credentials) {
+    def output = sh(script: "python ipam_subnet.py '${data}' '${credentials}'",returnStdout: true).toString().trim().replace("'",'"');
+    output = new JsonSlurperClassic().parseText(output);
+    if(output.subnets != null && output.subnets.size() == 0){
+            println(output.error)
+            currentBuild.result = 'FAILURE'
+            result = 'FAIL'
+            return false;
+    }else{
+       infobloxOutput = output;
+       return true;
+    }
+}
+
+def getLocation(String landingZoneName) {
+    def location = "default"
+    if (landingZoneName.contains("-we-")) location = "westeurope"
+    if (landingZoneName.contains("-ne-")) location = "northeurope"
+    if (landingZoneName.contains("-gwc-")) location = "germanywestcentral"
+    if (landingZoneName.contains("-eus2-")) location = "eastus2"
+    if (landingZoneName.contains("-wus2-")) location = "westus2"
+    return location;
+}
+
+def getEnvFolderName(String b2bRepo) {
+    def output = ""
+    if (b2bRepo.contains("-tst") || b2bRepo.contains("-int")) output = "tstcur"
+    if (b2bRepo.contains("-des") || b2bRepo.contains("-dev")) output = "rnd"
+    if (b2bRepo.contains("-prd")) output = "prdcur"
+    return output;
+}
+
+def getb2bRepo(String env) {
+    def output = ""
+    if (env.contains("-tst-")) output = "tg-env-e2e-tst"
+    if (env.contains("-des-")) output = "tg-env-e2e-des"
+    if (env.contains("-dev-")) output = "tg-env-e2e-dev"
+    if (env.contains("-prd-")) output = "tg-env-e2e-prd"
+    if (env.contains("-int-")) output = "tg-env-e2e-int"
+    return output;
+}
+
+def deleteSubnet(input,credentials){
+    git branch:'subnet_service',credentialsId: 'svc-CAI-cicd', url: "https://bitbucket.pob.company.net/scm/${CAIKey}/tf-env-azr-selfservice-subnet.git"
+    sh(script: "python ipam_vnet_delete.py '${input}' '${credentials}'",returnStdout: true);
+}
+
+def subnetService(){
+    terraformAutoImageVersion = '2.2.6'
+    podTemplate(yaml: """
+    apiVersion: v1
+    kind: Pod
+    spec:
+      securityContext: 
+        runAsUser: 1000
+      containers:
+      - name: terraform
+        image: repository.adp.company.net:5002/docker-production/CAI/terraform-automation-azr:${terraformAutoImageVersion}
+        resources:
+          requests:
+            cpu: "0.5"
+            memory: "500Mi"
+          limits:
+            cpu: "0.5"
+            memory: "500Mi"
+        command:
+        - cat
+        tty: true
+    """) {
+    node(POD_LABEL) {
+        
+withCredentials([usernamePassword(credentialsId: 'cit-', usernameVariable: 'gitUsername', passwordVariable: 'gitPassword'),
+                usernamePassword(credentialsId: 'cit', usernameVariable: 'infoBloxUsername', passwordVariable: 'infoBloxPassword')]) {
+        container('terraform') {
+
+        
+        try {
+            stage('Setup') {
+            if(vnetNotSupported.contains(params.vnet)){
+                println( "v1 version of automation is not support in Subnet Self Service For this Vnet: "+params.vnet)
+                currentBuild.result = 'FAILURE'
+                        result = 'FAIL'
+                        script{
+			            sh "exit 1"
+            }
+            
+            }
+            checkout scm
+            customRepo = 'generic-production-CAI'
+            echo params.vnet
+            echo String.valueOf("${params.subnets}")
+            }
+
+            stage('Extract Vnet cidr using DUA API') {
+                DUADetails = getDUADetails(params.vnet) // get DUA details
+			}
+            
+            stage('Reseve IP for subnet in IPAM') {
+                def data = buildInfobloxInput(params.vnet, DUADetails, params.subnets) // build infoblox input
+
+                def credentials = new JsonBuilder([username: infoBloxUsername, password: infoBloxPassword]).toString(); // build infoblox credentials
+                if(updateInfoblox(data, credentials)){// update infoblox
+           stage('Generate YAML content and update in DUA repo') {
+                def yamlInput = buildYAMLgenerationInput(params.vnet, DUADetails, params.subnets)
+
+                  container('terraform') {
+
+                    sh(script: "python DUAFileGenrating.py '${yamlInput}'",returnStdout: true);
+                    def repoName = "DUAs-"+DUADetails.scope;
+                    def forkedName = createFork(gitUsername,gitPassword,repoName,clzKey,DUAKey)
+                    def fileName = DUADetails.scope+".yml";
+                    git branch:'master',credentialsId: 'cid', url: "https://bitbucket.pob.company.net/scm/${clzKey}/${forkedName}.git"
+                    def update = sh(script:"""
+                    git config user.email "svc-CAI-cicd@company.com"
+                    git config user.name "svc-CAI-cicd"
+                    git branch subnetUpdate
+                    git checkout subnetUpdate
+                    cat final.yml >> ${fileName}
+                    rm final.yml
+                    git config --global push.default matching
+                    git config --global push.default simple
+                    git add .
+                    git commit -m "Self Service Changes"
+                    git push --set-upstream https://"${gitUsername}":"${gitPassword}"@bitbucket.pob.company.net/scm/${clzKey}/${forkedName}.git subnetUpdate""")
+                    
+                     def res=sh(script: """
+                        curl -X POST -H "Content-Type: application/json" -u '$gitUsername:$gitPassword' https://bitbucket.pob.company.net/rest/api/1.0/projects/${DUAKey}/repos/${repoName}/pull-requests -d '''{"title":"Subnet Service PR","description":"Automatically issued by Subnet Service pipeline","fromRef":{"id":"refs/heads/subnetUpdate","repository":{"slug":"${forkedName}","name":null,"project": {"key": "${clzKey}"}}},"toRef":{"id":"refs/heads/master","repository":{"slug":"${repoName}","name":null,"project": {"key": "${DUAKey}"}}}}'''
+                    """, returnStdout: true)
+                    res =  new JsonSlurperClassic().parseText(res)
+                    if(res.errors != null){
+                    return null;
+                    }
+                    def prID = res.id;
+                    println("CreatePR with ID "+prID)
+                    def buildSuccess = checkBuildSuccess(gitUsername,gitPassword,prID,repoName,DUAKey);
+                    if(buildSuccess){
+                        checkApiIfUpdated(params.vnet,infobloxOutput.subnets[0].cidr);
+                        deleteFork(gitUsername,gitPassword,forkedName,clzKey);
+                    }else{
+                        deleteSubnet(data,credentials)
+                        deleteFork(gitUsername,gitPassword,forkedName,clzKey);
+                        currentBuild.result = 'FAILURE'
+                        result = 'FAIL'
+                         script{
+			            println("PR build failed for the repo https://bitbucket.pob.company.net/projects/DUA/repos/"+repoName+"/pull-requests/"+prID+"/overview")
+                        sh "exit 1"
+                    }
+
+                    }
+                    }
+             }
+            stage('Update new DUA version in componet') {
+                 container('terraform') {
+                 def repoName = getb2bRepo(params.vnet);
+                 def forkedName = createFork(gitUsername,gitPassword,repoName,clzKey,CAIKey)
+                 def nameFolder = params.vnet.split("-net-01")[0];
+                 def update = sh(script:""" 
+                 mkdir DUA_repo
+                 cd DUA_repo
+                 git config --global user.email "cyil.dioli@company.com"
+                 git config --global user.name "svc-CAI-cicd"
+                 git clone https://'${gitUsername}':'${gitPassword}'@bitbucket.pob.company.net/scm/${clzKey}/${forkedName}.git
+                 cd ${forkedName}
+                 cd src
+                 cd ${getEnvFolderName(repoName)}
+                 cd ${getLocation(params.vnet)}
+                 cd ${nameFolder}
+                 python -c 'import yaml;e=open("DUA.yml");y=yaml.safe_load(e);y["DUA_version"]= "${DUAVersion}";f = open("DUA.yml", "w"); f.write(yaml.dump(y)); f.close()'
+                 git config --global push.default matching
+                 git config --global push.default simple
+                 git add .
+                 git commit -m "Self Service Changes"
+                 git push --set-upstream https://"${gitUsername}":"${gitPassword}"@bitbucket.pob.company.net/scm/${clzKey}/${forkedName}.git
+                 """, returnStdout: true);
+                def res=sh(script: """
+                        curl -X POST -H "Content-Type: application/json" -u '$gitUsername:$gitPassword' https://bitbucket.pob.company.net/rest/api/1.0/projects/${CAIKey}/repos/${repoName}/pull-requests -d '''{"title":"Subnet Service PR","description":"Automatically issued by Subnet Service pipeline","fromRef":{"id":"refs/heads/master","repository":{"slug":"${forkedName}","name":null,"project": {"key": "${clzKey}"}}},"toRef":{"id":"refs/heads/master","repository":{"slug":"${repoName}","name":null,"project": {"key": "${CAIKey}"}}}}'''
+                    """, returnStdout: true)
+                   
+                    res =  new JsonSlurperClassic().parseText(res)
+                    if(res.errors != null){
+                    return null;
+                    }
+                    def prID = res.id;
+                    println("CreatePR with ID "+prID)
+                    def buildSuccess = checkBuildSuccess(gitUsername,gitPassword,prID,repoName,CAIKey);
+                    if(buildSuccess){
+                    deleteFork(gitUsername,gitPassword,forkedName,clzKey);
+                    }else{
+                        currentBuild.result = 'FAILURE'
+                        result = 'FAIL'
+                        script{
+			            println("PR build failed for the repo "+ "https://bitbucket.pob.company.net/projects/CAI/repos/"+repoName+"/pull-requests/"+prID+"/overview" +" please check the PR for more details.")
+                        sh "exit 1"
+                    }
+                    }
+                    
+                 } 
+                 
+                 
+             }
+                } 
+             
+             }
+        
+                         
+ } catch (e) {
+            println e
+            currentBuild.result = 'FAILURE'
+            result = 'FAIL'
+        }
+        finally {
+            cleanWs()
+            echo 'Done'
+        }
+    }
+    }
+    }
+    }
+}
+
+properties([
+    parameters ([
+        text(name: 'vnet',  description: 'landing zone name example: "domain-tst-we-int-03-net-01"', defaultValue: ''),
+        text(name: 'subnets',  description: 'subnets to be created example : <br> [<br>{"mask":"28",<br>"comment":"tnz1",<br>"zonename":"tnz",<br>"zonetype":"app",<br>"provider_specific": {"link_endpoint_policies": true,"link_service_policies": false,"delegations": {"Microsoft.Web.serverFarms": {"actions": ["Microsoft.Network/virtualNetworks/subnets/action"],"name": "Microsoft.Web/serverFarms"}},"service_endpoints": ["Microsoft.AzureActiveDirectory"]}<br>] ', defaultValue: '')      
+    ])
+])
+
+timestamps {
+    timeout(time: 240, unit: "MINUTES") {
+        subnetService()
+
+
+	}
+}
+    
