@@ -1,0 +1,19 @@
+pipeline {
+agent any
+parameters {
+text(name:'Name',description: 'What is your Full Name?', defaultValue: '')
+}
+stages{
+    stage ('Summary') {
+        steps {
+         script {
+             def printname ="${params.Name}"
+                println(printname) 
+           
+              }
+                  }
+              
+                      }
+                   
+     }
+} 
