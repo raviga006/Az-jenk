@@ -1,0 +1,8 @@
+subnets to be created example :
+[
+{"mask":"28",
+"comment":"tn21",
+"zonename":"tn2",
+"zonetype":"app",
+"provider_specific": {"link_endpoint_policies": true,"link_service_policies": false,"delegations": {"Microsoft.Web.serverFarms": {"actions": ["Microsoft.Network/virtualNetworks/subnets/action"],"name": "Microsoft.Web/serverFarms"}},"service_endpoints": ["Microsoft.AzureActiveDirectory"]}
+]
