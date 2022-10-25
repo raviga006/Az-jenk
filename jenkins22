@@ -198,7 +198,9 @@ def buildSubnetsList(subnets) {
         provider_specific:it.provider_specific);
         list.add(subnet)
     }
-    return list
+    println list.unique()
+    def uniq = list.unique(false) 
+    return uniq
 }
 
 def checkApiIfUpdated(vnet,subnet){
